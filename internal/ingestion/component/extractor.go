@@ -698,16 +698,19 @@ func (c *ExtractorComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 			callIn := in
 			callIn.prompt = substituteChunkPlaceholders(in.prompt, ck, text)
 			callIn.systemPrompt = substituteChunkPlaceholders(in.systemPrompt, ck, text)
-			// buildExtractorMessages appends chunkText to the user
-			// message unconditionally. When the chunk text was already
-			// embedded via a {text}/{chunks} placeholder above, passing
-			// it again would duplicate the content in the final prompt.
-			// Suppress the automatic append in that case (the keyword/
-			// question helper paths do the same by passing "").
-			callChunkText := text
-			if strings.Contains(in.prompt, "{text}") || strings.Contains(in.prompt, "{chunks}") ||
-				strings.Contains(in.systemPrompt, "{text}") || strings.Contains(in.systemPrompt, "{chunks}") {
-				callChunkText = ""
+			// buildExtractorMessages appends chunkText to the user message
+			// unconditionally. Append it ONLY when no placeholder was actually
+			// substituted — i.e. the prompt is static text (e.g. the resume
+			// template, which relies on this append to give the LLM the chunk
+			// content). When a placeholder like {text}/{chunks}/
+			// {content_with_weight} was substituted, the chunk content is
+			// already in the prompt and appending again would duplicate it.
+			// Comparing substituted vs original avoids the brittle
+			// {text}/{chunks} substring check (which missed other chunk-field
+			// placeholders and misfired when a {text} wasn't resolvable).
+			callChunkText := ""
+			if callIn.prompt == in.prompt && callIn.systemPrompt == in.systemPrompt {
+				callChunkText = text
 			}
 			ans, callErr := c.call(timeoutCtx, db, callIn, callChunkText)
 			if callErr != nil {

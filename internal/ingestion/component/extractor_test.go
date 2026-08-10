@@ -1336,6 +1336,45 @@ func TestResolveExtractorChatTarget_EmptyLLMID(t *testing.T) {
 	// Contract: no panic, no error for empty llmID.
 }
 
+// TestExtractorComponent_Invoke_ContentWithWeightPlaceholder verifies that
+// a prompt referencing {content_with_weight} (a chunk field that is NOT in
+// the {text}/{chunks} suppression set of the old code) substitutes the
+// field without also appending the chunk text a second time. Regression
+// guard for the duplicate-injection bug fixed in
+// fix/extractor-chunk-text-injection.
+func TestExtractorComponent_Invoke_ContentWithWeightPlaceholder(t *testing.T) {
+	stub := withStubChatInvoker(t,
+		stubResponse{Content: "answer"},
+	)
+
+	c := &ExtractorComponent{Param: schema.ExtractorParam{
+		FieldName: "out",
+		Prompt:    "Weighted: {content_with_weight}",
+		LLMID:     "gpt-4o-mini",
+	}}
+	_, err := c.Invoke(t.Context(), nil, map[string]any{
+		"chunks": []map[string]any{{"content_with_weight": "weighted doc"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	var userContent string
+	for _, msg := range stub.lastReq.Messages {
+		if msg.Role == eschema.User {
+			userContent = msg.Content
+		}
+	}
+	if strings.Contains(userContent, "{content_with_weight}") {
+		t.Errorf("prompt still contains literal {content_with_weight}: %q", userContent)
+	}
+	if n := strings.Count(userContent, "weighted doc"); n != 1 {
+		t.Errorf("chunk text appears %d times, want 1 (no duplicate append): %q", n, userContent)
+	}
+}
+
 // TestExtractorComponent_Invoke_SubstitutesPlaceholders verifies that
 // {field_name} placeholders in the user prompt are substituted with
 // the current chunk's field values before the LLM call, matching
