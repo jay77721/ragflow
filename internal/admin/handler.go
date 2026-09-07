@@ -945,6 +945,10 @@ func (h *Handler) PullMessageFromQueue(c *gin.Context) {
 	}
 
 	msgQueueEngine := engine.GetMessageQueueEngine()
+	if err := msgQueueEngine.InitConsumer(common.TaskSubject); err != nil {
+		common.ErrorWithCode(c, common.CodeBadRequest, err.Error())
+		return
+	}
 	messages, err := msgQueueEngine.PullMessagesForAdmin(req.MessageCount)
 	if err != nil {
 		common.ErrorWithCode(c, common.CodeBadRequest, err.Error())
