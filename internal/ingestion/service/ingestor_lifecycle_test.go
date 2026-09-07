@@ -329,6 +329,29 @@ func TestStartNilEngine(t *testing.T) {
 	}
 }
 
+// TestStartRetainsPullCapacityFailure prevents a second Start call from
+// reporting success after the durable consumer rejected the configured
+// MaxWaiting capacity on the first attempt.
+func TestStartRetainsPullCapacityFailure(t *testing.T) {
+	previousEngine := engine.GetMessageQueueEngine()
+	engine.SetMessageQueueEngine(testutil.SetupNatsEngine(t))
+	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
+
+	ingestor := newUnitIngestor("test-pull-capacity", 1, nil)
+	ingestor.SetRequiredTaskPullWaiters(513)
+	t.Cleanup(func() { ingestor.Stop(context.Background()) })
+
+	if err := ingestor.Start(); err == nil {
+		t.Fatal("first Start accepted a pull capacity above consumer MaxWaiting")
+	}
+	if err := ingestor.Start(); err == nil {
+		t.Fatal("second Start hid the prior pull capacity failure")
+	}
+	if got := ingestor.activeWorkers.Load(); got != 0 {
+		t.Fatalf("active workers after failed Start = %d, want 0", got)
+	}
+}
+
 // TestExecuteTask_MarkFailedAfterCtxCancelAcks verifies that a generic task
 // failure is persisted and acknowledged even after the task context is
 // cancelled by the pipeline.

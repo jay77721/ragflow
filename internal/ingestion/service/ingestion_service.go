@@ -86,6 +86,7 @@ type Ingestor struct {
 	dispatcherWg sync.WaitGroup
 	workerWg     sync.WaitGroup
 	startOnce    sync.Once
+	startErr     error
 	workerOnce   sync.Once // guards startWorkerPool; must NOT be startOnce (Start wraps start() in startOnce, and start() calls startWorkerPool -> re-entry deadlock)
 	stopOnce     sync.Once // guards close(ShutdownCh) against double-close on repeated Stop
 
@@ -192,11 +193,10 @@ const taskPullRequestTimeout = 1 * time.Second
 
 func (e *Ingestor) Start() error {
 	common.Info(fmt.Sprintf("Ingestor %s initialized", e.id))
-	var startErr error
 	e.startOnce.Do(func() {
-		startErr = e.start()
+		e.startErr = e.start()
 	})
-	return startErr
+	return e.startErr
 }
 
 // start runs the full startup sequence. It is invoked at most once (guarded by
