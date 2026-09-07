@@ -269,11 +269,23 @@ func (e *Ingestor) checkSlotInvariant() {
 	if e.dispatchCtx.Err() != nil {
 		return
 	}
+	if e.activeWorkers.Load() != e.maxConcurrency {
+		return
+	}
+	for i := 0; i < 3; i++ {
+		idle := e.idleSlotsCount.Load()
+		reserved := e.reservedSlotsCount.Load()
+		handling := e.handlingSlotsCount.Load()
+		if idle+reserved+handling == e.maxConcurrency {
+			return
+		}
+		runtime.Gosched()
+	}
 	idle := e.idleSlotsCount.Load()
 	reserved := e.reservedSlotsCount.Load()
 	handling := e.handlingSlotsCount.Load()
 	total := idle + reserved + handling
-	if e.activeWorkers.Load() == e.maxConcurrency && total != e.maxConcurrency {
+	if total != e.maxConcurrency {
 		e.slotInvariantErrors.Add(1)
 		common.Error("slot conservation invariant violated",
 			fmt.Errorf("idle (%d) + reserved (%d) + handling (%d) = %d != maxConcurrency (%d)",
@@ -372,6 +384,8 @@ func (e *Ingestor) start() error {
 	// WaitGroup Add/Wait race.
 	e.dispatcherWg.Add(1)
 	go e.consumeLoop()
+
+	RegisterActiveIngestor(e)
 
 	return nil
 }
@@ -775,10 +789,14 @@ func (e *Ingestor) startWorkerPool() {
 func (e *Ingestor) workerLoop(slot *workerSlot) {
 	defer e.workerWg.Done()
 	defer e.activeWorkers.Add(-1)
-	e.activeWorkers.Add(1)
 	common.Info(fmt.Sprintf("Worker %d started", slot.id))
+	first := true
 	for {
 		e.markSlotIdle(slot)
+		if first {
+			first = false
+			e.activeWorkers.Add(1)
+		}
 		select {
 		case e.idleSlots <- slot:
 		case <-e.dispatchCtx.Done():
@@ -911,7 +929,7 @@ func (e *Ingestor) executeTaskWithHeartbeat(ctx context.Context, taskCtx *taskpk
 		perTaskCancel()
 	}
 
-	e.settleMessageWithHeartbeat(ctx, taskCtx, hb, func(ctx context.Context) bool {
+	e.settleMessage(ctx, taskCtx, hb, func(ctx context.Context) bool {
 		return e.runTask(ctx, task)
 	})
 }
@@ -965,6 +983,10 @@ func (e *Ingestor) markFailed(ctx context.Context, taskID string) bool {
 func (e *Ingestor) runTask(ctx context.Context, task *entity.IngestionTask) bool {
 	select {
 	case <-ctx.Done():
+		if e.ctx.Err() != nil || e.dispatchCtx.Err() != nil {
+			common.Info(fmt.Sprintf("Task %s aborted due to ingestor shutdown, leaving for redelivery", task.ID))
+			return false
+		}
 		common.Info(fmt.Sprintf("Task %s cancelled", task.ID))
 		e.markCancelProgress(task)
 		stopped := e.markStopped(context.Background(), task.ID)
@@ -1031,6 +1053,10 @@ func (e *Ingestor) runTask(ctx context.Context, task *entity.IngestionTask) bool
 
 	if err := e.runDocumentTask(ctx, task); err != nil {
 		if errors.Is(err, context.Canceled) {
+			if e.ctx.Err() != nil || e.dispatchCtx.Err() != nil {
+				common.Info(fmt.Sprintf("Task %s pipeline interrupted by ingestor shutdown, leaving for redelivery", task.ID))
+				return false
+			}
 			common.Info(fmt.Sprintf("Task %s cancelled during pipeline", task.ID))
 			e.markCancelProgress(task)
 			stopped := e.markStopped(ctx, task.ID)
@@ -1126,20 +1152,14 @@ func (e *Ingestor) settleToTerminal(ctx context.Context, taskID string) error {
 	}
 }
 
-// settleMessage runs body under a heartbeat, then settles the MQ message. The
-// heartbeat is stopped (and waited on) before ack/nack — see Heartbeat.Stop.
+// settleMessage runs body under an injected heartbeat lease, then settles the MQ message.
+// The heartbeat is stopped (and waited on) before ack/nack — see Heartbeat.Stop.
 // A panic in body is recovered: the task is marked FAILED and the message is
 // Nacked for redelivery, so a single task's panic never crashes the worker.
 // Settlement queries the DB for the task's actual status: a terminal state
 // (COMPLETED/STOPPED/FAILED) means Ack; anything else means Nack. The body's
 // return value is advisory only — DB truth is authoritative (BP1).
-func (e *Ingestor) settleMessage(ctx context.Context, taskCtx *taskpkg.TaskContext, body func(context.Context) bool) (terminal bool) {
-	hb := NewHeartbeat(taskCtx.ID(), taskCtx.Handle, e.heartbeatInterval).WithContext(taskCtx.Ctx)
-	hb.Start()
-	return e.settleMessageWithHeartbeat(ctx, taskCtx, hb, body)
-}
-
-func (e *Ingestor) settleMessageWithHeartbeat(ctx context.Context, taskCtx *taskpkg.TaskContext, hb *Heartbeat, body func(context.Context) bool) (terminal bool) {
+func (e *Ingestor) settleMessage(ctx context.Context, taskCtx *taskpkg.TaskContext, hb *Heartbeat, body func(context.Context) bool) (terminal bool) {
 	defer func() {
 		hb.Stop() // stop heartbeat (and wait) before ack/nack
 		if r := recover(); r != nil {
@@ -1394,6 +1414,7 @@ func (e *Ingestor) recordTerminalPipelineLog(ctx context.Context, ingestionTask 
 // bounds the wait for non-cooperative task execution.
 func (e *Ingestor) Stop(ctx context.Context) {
 	common.Info(fmt.Sprintf("Stopping ingestor %s", e.id))
+	UnregisterActiveIngestor(e.id)
 	e.dispatchCancel()
 
 	waitDone := make(chan struct{})

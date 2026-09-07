@@ -296,3 +296,153 @@ func TestIntegration_ConsumerMaxWaitingCapacityValidation(t *testing.T) {
 		t.Fatal("expected 513 to be rejected, but succeeded")
 	}
 }
+
+// TestIntegration_ShutdownRedeliveryRecovery verifies TaskRP.md §6.2 item 4:
+// After an ingestor shutdown times out under full load (SIGTERM simulation):
+// - Already finished tasks are settled (Acked) and never redelivered;
+// - In-flight uncompleted tasks have their leases abandoned (stopActiveLeases),
+//   and are redelivered by the broker to a successor ingestor and completed.
+func TestIntegration_ShutdownRedeliveryRecovery(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanup := testutil.ReplaceDBForTest(t, db)
+	defer cleanup()
+
+	host, port := setupRealNatsCluster(t)
+	mq := natsengine.NewNatsEngine(host, port)
+	if err := mq.Init(); err != nil {
+		t.Fatalf("mq.Init: %v", err)
+	}
+	if err := mq.InitConsumer(common.TaskSubject); err != nil {
+		t.Fatalf("mq.InitConsumer: %v", err)
+	}
+
+	previousEngine := engine.GetMessageQueueEngine()
+	engine.SetMessageQueueEngine(mq)
+	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
+
+	// Seed two tasks: taskA (fast) and taskB (slow, will be in-flight during SIGTERM)
+	taskIDs := seedBurstTasks(t, db, 2)
+	taskIDA := taskIDs[0]
+	taskIDB := taskIDs[1]
+
+	for _, id := range []string{taskIDA, taskIDB} {
+		if err := db.Model(&entity.IngestionTask{}).Where("id = ?", id).
+			Update("status", common.SCHEDULED).Error; err != nil {
+			t.Fatalf("schedule task %s: %v", id, err)
+		}
+	}
+
+	ingestor1 := newUnitIngestor("shutdown-ingestor-1", 2, []string{"pdf"})
+	ingestor1.heartbeatInterval = 500 * time.Millisecond
+
+	taskBStarted := make(chan struct{})
+	var (
+		taskAExecutions atomic.Int32
+		taskBExecutions atomic.Int32
+	)
+
+	ingestor1.runDocumentTask = func(ctx context.Context, task *entity.IngestionTask) error {
+		if task.ID == taskIDA {
+			taskAExecutions.Add(1)
+			return nil
+		}
+		if task.ID == taskIDB {
+			taskBExecutions.Add(1)
+			close(taskBStarted)
+			// Simulate long-running task interrupted by shutdown
+			select {
+			case <-time.After(30 * time.Second):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+
+	if err := ingestor1.Start(); err != nil {
+		t.Fatalf("ingestor1.Start: %v", err)
+	}
+
+	// Publish taskA and taskB
+	for _, id := range []string{taskIDA, taskIDB} {
+		payload, err := json.Marshal(common.TaskMessage{
+			TaskID:   id,
+			TaskType: common.TaskTypeIngestionTask,
+		})
+		if err != nil {
+			t.Fatalf("marshal %s: %v", id, err)
+		}
+		if err := mq.PublishTask(common.TaskSubject, payload); err != nil {
+			t.Fatalf("publish %s: %v", id, err)
+		}
+	}
+
+	// Wait for taskB to start execution and taskA to complete
+	<-taskBStarted
+	deadlineA := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadlineA) {
+		var taskA entity.IngestionTask
+		if err := db.Where("id = ?", taskIDA).First(&taskA).Error; err == nil && taskA.Status == common.COMPLETED {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Simulate SIGTERM with 200ms graceful shutdown timeout (which will time out for taskB)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer stopCancel()
+	ingestor1.Stop(stopCtx)
+
+	// Ingestor1 timed out and cancelled taskB, calling stopActiveLeases().
+	// Now start ingestor2 to recover un-acked tasks from the shared consumer.
+	ingestor2 := newUnitIngestor("recovery-ingestor-2", 2, []string{"pdf"})
+	ingestor2.heartbeatInterval = 500 * time.Millisecond
+
+	var (
+		taskAExec2 atomic.Int32
+		taskBExec2 atomic.Int32
+	)
+	ingestor2.runDocumentTask = func(ctx context.Context, task *entity.IngestionTask) error {
+		if task.ID == taskIDA {
+			taskAExec2.Add(1)
+			return nil
+		}
+		if task.ID == taskIDB {
+			taskBExec2.Add(1)
+			return nil
+		}
+		return nil
+	}
+
+	if err := ingestor2.Start(); err != nil {
+		t.Fatalf("ingestor2.Start: %v", err)
+	}
+	defer ingestor2.Stop(context.Background())
+
+	// Wait for taskB to be redelivered and completed by ingestor2
+	deadlineB := time.Now().Add(12 * time.Second)
+	taskBCompleted := false
+	for time.Now().Before(deadlineB) {
+		var taskB entity.IngestionTask
+		if err := db.Where("id = ?", taskIDB).First(&taskB).Error; err == nil && taskB.Status == common.COMPLETED {
+			taskBCompleted = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !taskBCompleted {
+		t.Fatalf("taskB was not redelivered and completed after ingestor1 shutdown")
+	}
+
+	// Assertions:
+	// 1. taskA was settled by ingestor1 and NEVER executed by ingestor2 (no duplicate delivery)
+	if taskAExec2.Load() != 0 {
+		t.Fatalf("taskA was redelivered to ingestor2 (%d times), but it was already completed and Acked", taskAExec2.Load())
+	}
+	// 2. taskB was executed once on ingestor2 to completion
+	if taskBExec2.Load() != 1 {
+		t.Fatalf("taskB executions on ingestor2 = %d, want 1", taskBExec2.Load())
+	}
+}

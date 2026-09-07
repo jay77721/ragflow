@@ -40,6 +40,7 @@ func (r *Router) Setup(engine *gin.Engine) {
 	engine.GET("/healthz", r.handler.Healthz)
 	engine.GET("/", r.handler.Live)
 	engine.GET("/live", r.handler.Live)
+	engine.GET("/metrics", r.handler.Metrics)
 
 	// Admin API routes with prefix /api/v1/admin
 	admin := engine.Group("/api/v1/admin")

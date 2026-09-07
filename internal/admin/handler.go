@@ -25,6 +25,7 @@ import (
 	"ragflow/internal/engine"
 	"ragflow/internal/engine/redis"
 	"ragflow/internal/handler"
+	ingestion "ragflow/internal/ingestion/service"
 	"ragflow/internal/server"
 	"ragflow/internal/service"
 	"ragflow/internal/storage"
@@ -74,6 +75,12 @@ func (h *Handler) Healthz(c *gin.Context) {
 // Live endpoint
 func (h *Handler) Live(c *gin.Context) {
 	common.SuccessNoData(c, "")
+}
+
+// Metrics exports Prometheus metrics for ingestors and server components.
+func (h *Handler) Metrics(c *gin.Context) {
+	metricsText := ingestion.ExportAllPrometheusText()
+	c.Data(http.StatusOK, "text/plain; version=0.0.4; charset=utf-8", []byte(metricsText))
 }
 
 // Ping ping endpoint

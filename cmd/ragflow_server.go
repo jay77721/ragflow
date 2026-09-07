@@ -53,6 +53,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
 	"ragflow/internal/agent/component"
@@ -605,6 +606,13 @@ func runIngestor(ctx context.Context, cancel context.CancelFunc, args *serverArg
 	if err := ingestor.Start(); err != nil {
 		common.Error("Failed to initialize ingestor", err)
 		return err
+	}
+
+	otelCfg := globalConfig.GetOpenTelemetryConfig()
+	if otelCfg.Enable {
+		if err := ingestor.RegisterOTelMetrics(otel.GetMeterProvider().Meter("ragflow/ingestor")); err != nil {
+			common.Warn("Failed to register OpenTelemetry metrics for ingestor", zap.Error(err))
+		}
 	}
 
 	common.Info("\n    ____                      __  _\n" +
