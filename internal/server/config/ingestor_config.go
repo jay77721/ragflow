@@ -19,9 +19,14 @@ import "github.com/spf13/viper"
 
 type IngestorConfig struct {
 	// MaxConcurrentWorkers bounds how many ingestion tasks the ingestor runs in
-	// parallel (the task channel width and dataset-level compile worker count
-	// default to this value). 0/negative falls back to runtime.NumCPU().
+	// parallel (and dataset-level compile worker count defaults to this value).
+	// 0/negative falls back to runtime.NumCPU().
 	MaxConcurrentWorkers int `mapstructure:"max_concurrent_workers"`
+	// RequiredTaskPullWaiters is the deployment-wide pull-consumer MaxWaiting
+	// requirement: all ingestor worker slots plus the bounded admin pull
+	// concurrency. The application validates the existing durable consumer
+	// against this value and never attempts to change MaxWaiting at runtime.
+	RequiredTaskPullWaiters int `mapstructure:"required_task_pull_waiters"`
 	// CompilerPoolSize bounds the process-wide knowledge-compilation worker
 	// pool that drives the cross-doc KNN / LLM-merge / write stages. 0/negative
 	// falls back to runtime.NumCPU() (or KC_COMPILE_CONCURRENCY if set).
@@ -31,6 +36,7 @@ type IngestorConfig struct {
 func (c *Config) ParseIngestorConfig(v *viper.Viper) error {
 	// Default Ingestor config
 	c.ingestor.MaxConcurrentWorkers = 2
+	c.ingestor.RequiredTaskPullWaiters = 512
 	c.ingestor.CompilerPoolSize = 0
 
 	if !v.IsSet("ingestor") {
@@ -43,6 +49,9 @@ func (c *Config) ParseIngestorConfig(v *viper.Viper) error {
 
 	if sub.IsSet("max_concurrent_workers") {
 		c.ingestor.MaxConcurrentWorkers = sub.GetInt("max_concurrent_workers")
+	}
+	if sub.IsSet("required_task_pull_waiters") {
+		c.ingestor.RequiredTaskPullWaiters = sub.GetInt("required_task_pull_waiters")
 	}
 
 	if sub.IsSet("compiler_pool_size") {

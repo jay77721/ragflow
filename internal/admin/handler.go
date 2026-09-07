@@ -945,12 +945,7 @@ func (h *Handler) PullMessageFromQueue(c *gin.Context) {
 	}
 
 	msgQueueEngine := engine.GetMessageQueueEngine()
-	err := msgQueueEngine.InitConsumer("tasks.RAGFLOW")
-	if err != nil {
-		common.ErrorWithCode(c, common.CodeBadRequest, err.Error())
-		return
-	}
-	messages, err := msgQueueEngine.GetMessages(req.MessageCount)
+	messages, err := msgQueueEngine.PullMessagesForAdmin(req.MessageCount)
 	if err != nil {
 		common.ErrorWithCode(c, common.CodeBadRequest, err.Error())
 		return
@@ -978,6 +973,7 @@ func (h *Handler) PullMessageFromQueue(c *gin.Context) {
 				"id":   taskMessage.TaskID,
 				"type": taskMessage.TaskType,
 			}
+			err = message.Nack()
 			if err == nil {
 				resultMessage["nack"] = "true"
 			} else {

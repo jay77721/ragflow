@@ -31,7 +31,7 @@ const (
 	TaskTypeSyncer = "syncer"
 	// TaskTypeMemory is the async memory-extraction task type. Memory tasks
 	// share the tasks.RAGFLOW subject and the Ingestor's consumer + worker
-	// pool with ingestion tasks; processMessage dispatches them by TaskType.
+	// pool with ingestion tasks; handleAndExecute dispatches them by TaskType.
 	// The memory-specific payload (message_dict/memory_id/source_id) is
 	// carried in TaskMessage.Payload.
 	TaskTypeMemory = "memory"
@@ -55,6 +55,15 @@ type TaskHandle interface {
 	// signalling the broker that the worker is still processing. Call
 	// periodically during long tasks to avoid in-flight redelivery.
 	InProgress() error
+}
+
+// TaskHandleStream yields task handles as the broker delivers them. Done is
+// closed after Messages, and Err reports the terminal pull error after Done
+// closes.
+type TaskHandleStream interface {
+	Messages() <-chan TaskHandle
+	Done() <-chan struct{}
+	Err() error
 }
 
 // RawMessage is a broker message carrying opaque bytes (used by the dataset-level

@@ -21,7 +21,7 @@ func TestRealConsumer_PipelineMessageRoutesToExecuteTask(t *testing.T) {
 	}
 
 	for {
-		handles, _ := natsEngine.GetMessages(1)
+		handles, _ := natsEngine.PullMessagesForAdmin(1)
 		if len(handles) == 0 {
 			break
 		}
@@ -62,9 +62,9 @@ func TestRealConsumer_PipelineMessageRoutesToExecuteTask(t *testing.T) {
 		t.Fatalf("PublishTask: %v", err)
 	}
 
-	handles, err := natsEngine.GetMessages(1)
+	handles, err := natsEngine.PullMessagesForAdmin(1)
 	if err != nil {
-		t.Fatalf("GetMessages: %v", err)
+		t.Fatalf("PullMessagesForAdmin: %v", err)
 	}
 	if len(handles) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(handles))

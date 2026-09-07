@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -69,7 +70,7 @@ func TestStartWorkerPool_StartOnceIdempotent(t *testing.T) {
 		t.Fatalf("activeWorkers after second startWorkerPool = %d, want %d (sync.Once not idempotent)", got, concurrency)
 	}
 
-	ingestor.cancel()
+	ingestor.dispatchCancel()
 	ingestor.workerWg.Wait()
 }
 
@@ -120,7 +121,7 @@ func TestStop_TimesOutWhenWorkerStuck(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	cleanup := testutil.ReplaceDBForTest(t, db)
 	defer cleanup()
-	_, _, docID, taskID := testutil.SeedTestData(t, db, testutil.WithPipelineID("flow-1"))
+	_, _, _, taskID := testutil.SeedTestData(t, db, testutil.WithPipelineID("flow-1"))
 
 	const concurrency int32 = 1
 	ingestor := newUnitIngestor("test-stuck", concurrency, []string{"pdf"})
@@ -142,10 +143,8 @@ func TestStop_TimesOutWhenWorkerStuck(t *testing.T) {
 		t.Fatalf("set task RUNNING: %v", err)
 	}
 
-	taskCtx := taskpkg.NewTaskContextForScheduling(ingestor.ctx, &entity.IngestionTask{
-		ID: taskID, DocumentID: docID, DatasetID: "kb-1", Status: common.RUNNING,
-	})
-	ingestor.taskChan <- taskCtx
+	slot := <-ingestor.idleSlots
+	slot.inbox <- &fakeTaskHandle{msg: common.TaskMessage{TaskID: taskID, TaskType: common.TaskTypeIngestionTask}}
 
 	select {
 	case <-started:
@@ -350,5 +349,75 @@ func TestStartSchedulesCreatedTasks(t *testing.T) {
 	}
 	if task.Status != common.SCHEDULED {
 		t.Fatalf("task status = %q, want %q", task.Status, common.SCHEDULED)
+	}
+}
+
+// TestSlotDispatcherDoesNotActivateTaskUntilWorkerOwnsSlot prevents a busy
+// worker from prefetching its next task. With the old buffered dispatcher,
+// task-2 moves to RUNNING while task-1 still occupies the only worker.
+func TestSlotDispatcherDoesNotActivateTaskUntilWorkerOwnsSlot(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanup := testutil.ReplaceDBForTest(t, db)
+	t.Cleanup(cleanup)
+
+	taskIDs := seedBurstTasks(t, db, 2)
+	for _, taskID := range taskIDs {
+		if err := db.Model(&entity.IngestionTask{}).Where("id = ?", taskID).
+			Update("status", common.SCHEDULED).Error; err != nil {
+			t.Fatalf("schedule task %s: %v", taskID, err)
+		}
+	}
+
+	queue := testutil.SetupNatsEngine(t)
+	previousEngine := engine.GetMessageQueueEngine()
+	engine.SetMessageQueueEngine(queue)
+	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
+
+	ingestor := newUnitIngestor("test-slot-dispatch", 1, []string{"pdf"})
+	releaseFirst := make(chan struct{})
+	firstStarted := make(chan struct{})
+	ingestor.runDocumentTask = func(_ context.Context, task *entity.IngestionTask) error {
+		if task.ID == taskIDs[0] {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		close(releaseFirst)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ingestor.Stop(ctx)
+	})
+
+	for _, taskID := range taskIDs {
+		payload, err := json.Marshal(common.TaskMessage{
+			TaskID:   taskID,
+			TaskType: common.TaskTypeIngestionTask,
+		})
+		if err != nil {
+			t.Fatalf("marshal task %s: %v", taskID, err)
+		}
+		if err := queue.PublishTask(common.TaskSubject, payload); err != nil {
+			t.Fatalf("publish task %s: %v", taskID, err)
+		}
+	}
+
+	if err := ingestor.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first task did not start")
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	var second entity.IngestionTask
+	if err := db.Where("id = ?", taskIDs[1]).First(&second).Error; err != nil {
+		t.Fatalf("load second task: %v", err)
+	}
+	if second.Status != common.SCHEDULED {
+		t.Fatalf("second task status = %q, want %q while the only worker is busy", second.Status, common.SCHEDULED)
 	}
 }

@@ -121,7 +121,7 @@ func (n *NatsEngine) PublishTask(subject string, payload []byte) error {
 	// Duplicate delivery is instead made safe at the consumer level:
 	// StartRunning's CREATED/SCHEDULED→RUNNING CAS plus the in-process claim guard
 	// prevent a second copy from executing while the first owner is active (see
-	// Ingestor.processMessage).
+	// Ingestor.handleAndExecute).
 	ack, err := n.jetStream.Publish(ctx, subject, payload)
 	if err != nil {
 		return err
@@ -256,7 +256,33 @@ func (n *NatsEngine) InitConsumer(subject string) error {
 	}
 	return nil
 }
-func (n *NatsEngine) GetMessages(messageCount int) ([]common.TaskHandle, error) {
+
+// ValidateTaskPullCapacity verifies the deployment-provided number of pending
+// pull requests fits the existing durable consumer. MaxWaiting is immutable,
+// so this method never attempts to update it.
+func (n *NatsEngine) ValidateTaskPullCapacity(required int) error {
+	if n.consumer == nil {
+		return errors.New("NATS consumer is nil, engine not properly initialized")
+	}
+	if required <= 0 {
+		return fmt.Errorf("required task pull capacity must be positive: %d", required)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := n.consumer.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("get task consumer info: %w", err)
+	}
+	if info.Config.MaxWaiting < required {
+		return fmt.Errorf("task consumer MaxWaiting %d is below required pull capacity %d", info.Config.MaxWaiting, required)
+	}
+	return nil
+}
+
+// PullMessagesForAdmin collects up to messageCount messages for the manual
+// admin endpoint. Scheduling code must use PullTaskStream instead.
+func (n *NatsEngine) PullMessagesForAdmin(messageCount int) ([]common.TaskHandle, error) {
 	if n.consumer == nil {
 		return nil, errors.New("NATS consumer is nil, engine not properly initialized")
 	}
@@ -270,6 +296,75 @@ func (n *NatsEngine) GetMessages(messageCount int) ([]common.TaskHandle, error) 
 		resultMessages = append(resultMessages, NewNatsMessageHandle(msg))
 	}
 	return resultMessages, nil
+}
+
+// PullTaskStream requests up to messageCount task messages and yields each
+// handle when it arrives. The caller must supply a deadline-bearing context so
+// the server-side pull request has a bounded expiry.
+func (n *NatsEngine) PullTaskStream(ctx context.Context, messageCount int) (common.TaskHandleStream, error) {
+	if n.consumer == nil {
+		return nil, errors.New("NATS consumer is nil, engine not properly initialized")
+	}
+	if messageCount <= 0 {
+		return nil, fmt.Errorf("message count must be positive: %d", messageCount)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("pull task stream context must have a deadline")
+	}
+
+	batch, err := n.consumer.Fetch(messageCount, jetstream.FetchContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("fetch task stream: %w", err)
+	}
+
+	stream := &taskHandleStream{
+		messages: make(chan common.TaskHandle),
+		done:     make(chan struct{}),
+	}
+	go stream.forward(ctx, batch)
+	return stream, nil
+}
+
+type taskHandleStream struct {
+	messages chan common.TaskHandle
+	done     chan struct{}
+
+	mu  sync.RWMutex
+	err error
+}
+
+func (s *taskHandleStream) Messages() <-chan common.TaskHandle {
+	return s.messages
+}
+
+func (s *taskHandleStream) Done() <-chan struct{} {
+	return s.done
+}
+
+func (s *taskHandleStream) Err() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.err
+}
+
+func (s *taskHandleStream) forward(ctx context.Context, batch jetstream.MessageBatch) {
+	defer close(s.messages)
+	defer close(s.done)
+	for message := range batch.Messages() {
+		select {
+		case s.messages <- NewNatsMessageHandle(message):
+		case <-ctx.Done():
+			s.setError(ctx.Err())
+			return
+		}
+	}
+	s.setError(batch.Error())
+}
+
+func (s *taskHandleStream) setError(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
 }
 
 func (n *NatsEngine) CheckStatus() string {

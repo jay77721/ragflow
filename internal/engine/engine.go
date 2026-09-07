@@ -112,8 +112,10 @@ type MessageQueue interface {
 	Init() error
 	Type() string
 	InitConsumer(subject string) error
+	ValidateTaskPullCapacity(required int) error
 	PublishTask(subject string, payload []byte) error
-	GetMessages(messageCount int) ([]common.TaskHandle, error)
+	PullTaskStream(ctx context.Context, messageCount int) (common.TaskHandleStream, error)
+	PullMessagesForAdmin(messageCount int) ([]common.TaskHandle, error)
 	ListMessages(messageType string, pending bool) ([]map[string]string, error)
 	ShowMessageQueue() (map[string]string, error)
 	CheckStatus() string
