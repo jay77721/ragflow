@@ -19,11 +19,14 @@ package nats
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"ragflow/internal/common"
+
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // TestPullTaskStreamDeliversFirstMessageBeforeBatchCompletes proves the
@@ -89,6 +92,124 @@ func TestPullTaskStreamRequiresDeadline(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "deadline") {
 		t.Fatalf("PullTaskStream error = %v, want deadline error", err)
+	}
+}
+
+// TestPullTaskStreamCancellationEndsLocalStream proves callers can stop a
+// pending Pull without waiting for its server-side expiry. The broker request
+// may persist until the deadline supplied to FetchContext, but it must not
+// survive that bounded window.
+func TestPullTaskStreamCancellationEndsLocalStream(t *testing.T) {
+	host, port := newEmbeddedNatsServer(t)
+	queue := NewNatsEngine(host, port)
+	if err := queue.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := queue.InitConsumer(common.TaskSubject); err != nil {
+		t.Fatalf("InitConsumer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	stream, err := queue.PullTaskStream(ctx, 1)
+	if err != nil {
+		cancel()
+		t.Fatalf("PullTaskStream: %v", err)
+	}
+	cancel()
+
+	select {
+	case <-stream.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("cancelled PullTaskStream did not end promptly")
+	}
+	if !errors.Is(stream.Err(), context.Canceled) {
+		t.Fatalf("PullTaskStream error = %v, want context cancellation", stream.Err())
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		info, err := queue.consumer.Info(t.Context())
+		if err != nil {
+			t.Fatalf("consumer info: %v", err)
+		}
+		if info.NumWaiting == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("cancelled PullTaskStream remained pending beyond its request expiry")
+}
+
+// TestPullTaskStreamReportsMaxWaiting distinguishes a consumer capacity
+// rejection from a request that simply reached its normal expiry. The
+// dispatcher can retry a rejected slot without treating it as an empty queue.
+func TestPullTaskStreamReportsMaxWaiting(t *testing.T) {
+	host, port := newEmbeddedNatsServer(t)
+	queue := NewNatsEngine(host, port)
+	if err := queue.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := queue.InitConsumer(common.TaskSubject); err != nil {
+		t.Fatalf("InitConsumer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := queue.stream.DeleteConsumer(ctx, "RAGFLOW_CONSUMER"); err != nil {
+		t.Fatalf("delete default consumer: %v", err)
+	}
+	consumer, err := queue.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Name:          "RAGFLOW_CONSUMER",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: "tasks.>",
+		MaxWaiting:    2,
+	})
+	if err != nil {
+		t.Fatalf("create limited consumer: %v", err)
+	}
+	queue.consumer = consumer
+
+	firstCtx, cancelFirst := context.WithTimeout(t.Context(), time.Second)
+	defer cancelFirst()
+	secondCtx, cancelSecond := context.WithTimeout(t.Context(), time.Second)
+	defer cancelSecond()
+	if _, err := queue.PullTaskStream(firstCtx, 1); err != nil {
+		t.Fatalf("first PullTaskStream: %v", err)
+	}
+	if _, err := queue.PullTaskStream(secondCtx, 1); err != nil {
+		t.Fatalf("second PullTaskStream: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	waitingReached := false
+	for time.Now().Before(deadline) {
+		info, err := queue.consumer.Info(t.Context())
+		if err != nil {
+			t.Fatalf("consumer info: %v", err)
+		}
+		if info.NumWaiting == 2 {
+			waitingReached = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waitingReached {
+		t.Fatal("first two PullTaskStreams did not occupy the configured waiting capacity")
+	}
+
+	thirdCtx, cancelThird := context.WithTimeout(t.Context(), time.Second)
+	defer cancelThird()
+	stream, err := queue.PullTaskStream(thirdCtx, 1)
+	if err == nil {
+		select {
+		case <-stream.Done():
+			err = stream.Err()
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("MaxWaiting rejection did not end the PullTaskStream")
+		}
+	}
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("MaxWaiting error = %v, want a distinct capacity rejection", err)
 	}
 }
 
