@@ -114,7 +114,6 @@ func InitMessageQueue() error {
 		messageQueueEngine = nats.NewNatsEngine(
 			natsConfig.Host,
 			natsConfig.Port,
-			globalConfig.GetIngestorConfig().MaxAdminPullConcurrency,
 		)
 		err := messageQueueEngine.Init()
 		if err != nil {

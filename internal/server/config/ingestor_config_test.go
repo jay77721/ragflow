@@ -22,29 +22,21 @@ import (
 	"github.com/spf13/viper"
 )
 
-func TestParseIngestorConfigReadsAdminPullConcurrency(t *testing.T) {
+func TestParseIngestorConfigReadsWorkerAndCompilerSettings(t *testing.T) {
 	v := viper.New()
 	v.Set("ingestor", map[string]any{
-		"max_admin_pull_concurrency": 3,
+		"max_concurrent_workers": 4,
+		"compiler_pool_size":     2,
 	})
 
 	config := &Config{}
 	if err := config.ParseIngestorConfig(v); err != nil {
 		t.Fatalf("ParseIngestorConfig: %v", err)
 	}
-	if got := config.GetIngestorConfig().MaxAdminPullConcurrency; got != 3 {
-		t.Fatalf("max admin pull concurrency = %d, want 3", got)
+	if got := config.GetIngestorConfig().MaxConcurrentWorkers; got != 4 {
+		t.Fatalf("max concurrent workers = %d, want 4", got)
 	}
-}
-
-func TestParseIngestorConfigRejectsNonPositiveAdminPullConcurrency(t *testing.T) {
-	v := viper.New()
-	v.Set("ingestor", map[string]any{
-		"max_admin_pull_concurrency": 0,
-	})
-
-	config := &Config{}
-	if err := config.ParseIngestorConfig(v); err == nil {
-		t.Fatal("ParseIngestorConfig accepted non-positive admin pull concurrency")
+	if got := config.GetIngestorConfig().CompilerPoolSize; got != 2 {
+		t.Fatalf("compiler pool size = %d, want 2", got)
 	}
 }
