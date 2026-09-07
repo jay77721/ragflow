@@ -329,23 +329,21 @@ func TestStartNilEngine(t *testing.T) {
 	}
 }
 
-// TestStartRetainsPullCapacityFailure prevents a second Start call from
-// reporting success after the durable consumer rejected the configured
-// MaxWaiting capacity on the first attempt.
-func TestStartRetainsPullCapacityFailure(t *testing.T) {
+// TestStartRetainsStartupFailure prevents a second Start call from
+// reporting success after initialization failed on the first attempt.
+func TestStartRetainsStartupFailure(t *testing.T) {
 	previousEngine := engine.GetMessageQueueEngine()
-	engine.SetMessageQueueEngine(testutil.SetupNatsEngine(t))
+	engine.SetMessageQueueEngine(nil)
 	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
 
-	ingestor := newUnitIngestor("test-pull-capacity", 1, nil)
-	ingestor.SetRequiredTaskPullWaiters(513)
+	ingestor := newUnitIngestor("test-startup-failure", 1, nil)
 	t.Cleanup(func() { ingestor.Stop(context.Background()) })
 
 	if err := ingestor.Start(); err == nil {
-		t.Fatal("first Start accepted a pull capacity above consumer MaxWaiting")
+		t.Fatal("first Start unexpectedly succeeded with nil engine")
 	}
 	if err := ingestor.Start(); err == nil {
-		t.Fatal("second Start hid the prior pull capacity failure")
+		t.Fatal("second Start hid the prior startup failure")
 	}
 	if got := ingestor.activeWorkers.Load(); got != 0 {
 		t.Fatalf("active workers after failed Start = %d, want 0", got)

@@ -274,34 +274,11 @@ func TestIntegration_SlowTaskHeartbeatPreventsPrematureRedelivery(t *testing.T) 
 	}
 }
 
-// TestIntegration_ConsumerMaxWaitingCapacityValidation verifies TaskRP.md §6.2:
-// ValidateTaskPullCapacity correctly accepts requirements <= consumer MaxWaiting and rejects > MaxWaiting.
-func TestIntegration_ConsumerMaxWaitingCapacityValidation(t *testing.T) {
-	host, port := setupRealNatsCluster(t)
-	mq := natsengine.NewNatsEngine(host, port)
-	if err := mq.Init(); err != nil {
-		t.Fatalf("mq.Init: %v", err)
-	}
-
-	// Initialize default consumer first
-	if err := mq.InitConsumer(common.TaskSubject); err != nil {
-		t.Fatalf("InitConsumer: %v", err)
-	}
-
-	// Validate against default 512 MaxWaiting
-	if err := mq.ValidateTaskPullCapacity(512); err != nil {
-		t.Fatalf("expected 512 to be accepted, got: %v", err)
-	}
-	if err := mq.ValidateTaskPullCapacity(513); err == nil {
-		t.Fatal("expected 513 to be rejected, but succeeded")
-	}
-}
-
 // TestIntegration_ShutdownRedeliveryRecovery verifies TaskRP.md §6.2 item 4:
 // After an ingestor shutdown times out under full load (SIGTERM simulation):
-// - Already finished tasks are settled (Acked) and never redelivered;
-// - In-flight uncompleted tasks have their leases abandoned (stopActiveLeases),
-//   and are redelivered by the broker to a successor ingestor and completed.
+//   - Already finished tasks are settled (Acked) and never redelivered;
+//   - In-flight uncompleted tasks have their leases abandoned (stopActiveLeases),
+//     and are redelivered by the broker to a successor ingestor and completed.
 func TestIntegration_ShutdownRedeliveryRecovery(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	cleanup := testutil.ReplaceDBForTest(t, db)

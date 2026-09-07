@@ -25,7 +25,6 @@ import (
 func TestParseIngestorConfigReadsAdminPullConcurrency(t *testing.T) {
 	v := viper.New()
 	v.Set("ingestor", map[string]any{
-		"required_task_pull_waiters": 5,
 		"max_admin_pull_concurrency": 3,
 	})
 
@@ -38,15 +37,14 @@ func TestParseIngestorConfigReadsAdminPullConcurrency(t *testing.T) {
 	}
 }
 
-func TestParseIngestorConfigRejectsAdminPullsAboveRequiredCapacity(t *testing.T) {
+func TestParseIngestorConfigRejectsNonPositiveAdminPullConcurrency(t *testing.T) {
 	v := viper.New()
 	v.Set("ingestor", map[string]any{
-		"required_task_pull_waiters": 2,
-		"max_admin_pull_concurrency": 3,
+		"max_admin_pull_concurrency": 0,
 	})
 
 	config := &Config{}
 	if err := config.ParseIngestorConfig(v); err == nil {
-		t.Fatal("ParseIngestorConfig accepted admin pull concurrency above required capacity")
+		t.Fatal("ParseIngestorConfig accepted non-positive admin pull concurrency")
 	}
 }

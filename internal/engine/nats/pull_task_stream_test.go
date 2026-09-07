@@ -291,20 +291,3 @@ func TestPullMessagesForAdminLimitsConcurrentRequests(t *testing.T) {
 		t.Fatal("second concurrent admin Pull waited for the first Fetch to expire")
 	}
 }
-
-// TestValidateTaskPullCapacityRejectsInsufficientMaxWaiting prevents startup
-// from accepting a dispatcher that the durable consumer cannot serve.
-func TestValidateTaskPullCapacityRejectsInsufficientMaxWaiting(t *testing.T) {
-	host, port := newEmbeddedNatsServer(t)
-	queue := NewNatsEngine(host, port)
-	if err := queue.Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	if err := queue.InitConsumer(common.TaskSubject); err != nil {
-		t.Fatalf("InitConsumer: %v", err)
-	}
-
-	if err := queue.ValidateTaskPullCapacity(513); err == nil {
-		t.Fatal("ValidateTaskPullCapacity accepted a requirement above the consumer MaxWaiting")
-	}
-}

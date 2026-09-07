@@ -263,29 +263,6 @@ func (n *NatsEngine) InitConsumer(subject string) error {
 	return nil
 }
 
-// ValidateTaskPullCapacity verifies the deployment-provided number of pending
-// pull requests fits the existing durable consumer. MaxWaiting is immutable,
-// so this method never attempts to update it.
-func (n *NatsEngine) ValidateTaskPullCapacity(required int) error {
-	if n.consumer == nil {
-		return errors.New("NATS consumer is nil, engine not properly initialized")
-	}
-	if required <= 0 {
-		return fmt.Errorf("required task pull capacity must be positive: %d", required)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	info, err := n.consumer.Info(ctx)
-	if err != nil {
-		return fmt.Errorf("get task consumer info: %w", err)
-	}
-	if info.Config.MaxWaiting < required {
-		return fmt.Errorf("task consumer MaxWaiting %d is below required pull capacity %d", info.Config.MaxWaiting, required)
-	}
-	return nil
-}
-
 // PullMessagesForAdmin collects up to messageCount messages for the manual
 // admin endpoint. Scheduling code must use PullTaskStream instead.
 func (n *NatsEngine) PullMessagesForAdmin(messageCount int) ([]common.TaskHandle, error) {

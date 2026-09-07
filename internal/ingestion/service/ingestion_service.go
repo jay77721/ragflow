@@ -64,11 +64,10 @@ type Ingestor struct {
 	dispatchCancel context.CancelFunc
 
 	// Configuration
-	maxConcurrency      int32
-	requiredPullWaiters int
-	supportedDocTypes   []string
-	version             string
-	heartbeatInterval   time.Duration
+	maxConcurrency    int32
+	supportedDocTypes []string
+	version           string
+	heartbeatInterval time.Duration
 
 	// Runtime state
 	currentTasks  map[string]struct{} // set of task IDs currently claimed by a worker
@@ -306,23 +305,22 @@ func NewIngestor(name string, maxConcurrency int32, supportedTypes []string) *In
 	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 	id := utility.GenerateUUID()
 	ingestor := &Ingestor{
-		id:                  id,
-		name:                name,
-		ctx:                 ctx,
-		cancel:              cancel,
-		dispatchCtx:         dispatchCtx,
-		dispatchCancel:      dispatchCancel,
-		maxConcurrency:      maxConcurrency,
-		requiredPullWaiters: int(maxConcurrency),
-		supportedDocTypes:   supportedTypes,
-		version:             "1.0.0",
-		currentTasks:        make(map[string]struct{}),
-		activeLeases:        make(map[*Heartbeat]*activeLease),
-		idleSlots:           make(chan *workerSlot, maxConcurrency),
-		ShutdownCh:          make(chan struct{}, 1),
-		ingestionTaskSvc:    servicepkg.NewIngestionTaskService(),
-		docState:            newDocStateUpdater(),
-		heartbeatInterval:   defaultHeartbeatInterval,
+		id:                id,
+		name:              name,
+		ctx:               ctx,
+		cancel:            cancel,
+		dispatchCtx:       dispatchCtx,
+		dispatchCancel:    dispatchCancel,
+		maxConcurrency:    maxConcurrency,
+		supportedDocTypes: supportedTypes,
+		version:           "1.0.0",
+		currentTasks:      make(map[string]struct{}),
+		activeLeases:      make(map[*Heartbeat]*activeLease),
+		idleSlots:         make(chan *workerSlot, maxConcurrency),
+		ShutdownCh:        make(chan struct{}, 1),
+		ingestionTaskSvc:  servicepkg.NewIngestionTaskService(),
+		docState:          newDocStateUpdater(),
+		heartbeatInterval: defaultHeartbeatInterval,
 	}
 	ingestor.runDocumentTask = ingestor.defaultRunDocumentTask
 	ingestor.runMemoryTask = ingestor.defaultRunMemoryTask
@@ -361,9 +359,6 @@ func (e *Ingestor) start() error {
 		return fmt.Errorf("message queue engine not initialized; run engine.InitMessageQueue first")
 	}
 	if err := msgQueueEngine.InitConsumer(common.TaskSubject); err != nil {
-		return err
-	}
-	if err := msgQueueEngine.ValidateTaskPullCapacity(e.requiredPullWaiters); err != nil {
 		return err
 	}
 	if dao.DB != nil {
@@ -524,12 +519,6 @@ func (e *Ingestor) returnIdleSlots(slots []*workerSlot) {
 // value disables memory extraction (received memory tasks are ack-skipped).
 func (e *Ingestor) SetMemoryMessageService(memorySvc *servicepkg.MemoryMessageService) {
 	e.memorySvc = memorySvc
-}
-
-// SetRequiredTaskPullWaiters sets the deployment-wide MaxWaiting capacity
-// required by all ingestor instances and manual admin pulls. Call before Start.
-func (e *Ingestor) SetRequiredTaskPullWaiters(required int) {
-	e.requiredPullWaiters = required
 }
 
 // SetKnowledgeCompileModelConfig supplies the default LLM/embedding model ids

@@ -69,8 +69,6 @@ otel:
 ingestor:
   mq_type: 'nats'
   max_concurrent_workers: 2
-  # Shared RAGFLOW_CONSUMER MaxWaiting target across all ingestor/admin instances.
-  required_task_pull_waiters: 512
   # Per-process cap for manual admin queue pulls; include every instance in the target above.
   max_admin_pull_concurrency: 1
   compiler_pool_size: 0
