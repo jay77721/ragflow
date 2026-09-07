@@ -140,6 +140,37 @@ func TestPullTaskStreamCancellationEndsLocalStream(t *testing.T) {
 	t.Fatal("cancelled PullTaskStream remained pending beyond its request expiry")
 }
 
+// TestPullTaskStreamReportsConnectionClose ensures a broker connection loss is
+// observable as a Pull failure rather than being confused with an empty queue
+// reaching its request expiry.
+func TestPullTaskStreamReportsConnectionClose(t *testing.T) {
+	host, port := newEmbeddedNatsServer(t)
+	queue := NewNatsEngine(host, port)
+	if err := queue.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := queue.InitConsumer(common.TaskSubject); err != nil {
+		t.Fatalf("InitConsumer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	stream, err := queue.PullTaskStream(ctx, 1)
+	if err != nil {
+		t.Fatalf("PullTaskStream: %v", err)
+	}
+	queue.nc.Close()
+
+	select {
+	case <-stream.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("connection close did not end pending PullTaskStream")
+	}
+	if err := stream.Err(); !errors.Is(err, errTaskStreamConnectionLost) {
+		t.Fatalf("connection-close error = %v, want connection-lost failure", err)
+	}
+}
+
 // TestPullTaskStreamReportsMaxWaiting distinguishes a consumer capacity
 // rejection from a request that simply reached its normal expiry. The
 // dispatcher can retry a rejected slot without treating it as an empty queue.

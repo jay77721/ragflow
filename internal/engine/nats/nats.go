@@ -317,6 +317,9 @@ func (n *NatsEngine) PullTaskStream(ctx context.Context, messageCount int) (comm
 	if n.consumer == nil {
 		return nil, errors.New("NATS consumer is nil, engine not properly initialized")
 	}
+	if n.nc == nil {
+		return nil, errors.New("NATS connection is nil, engine not properly initialized")
+	}
 	if messageCount <= 0 {
 		return nil, fmt.Errorf("message count must be positive: %d", messageCount)
 	}
@@ -324,8 +327,10 @@ func (n *NatsEngine) PullTaskStream(ctx context.Context, messageCount int) (comm
 		return nil, errors.New("pull task stream context must have a deadline")
 	}
 
+	statusChanges := n.nc.StatusChanged(nats.DISCONNECTED, nats.CLOSED)
 	batch, err := n.consumer.Fetch(messageCount, jetstream.FetchContext(ctx))
 	if err != nil {
+		n.nc.RemoveStatusListener(statusChanges)
 		return nil, fmt.Errorf("fetch task stream: %w", err)
 	}
 
@@ -333,9 +338,13 @@ func (n *NatsEngine) PullTaskStream(ctx context.Context, messageCount int) (comm
 		messages: make(chan common.TaskHandle),
 		done:     make(chan struct{}),
 	}
-	go stream.forward(ctx, batch)
+	go stream.forward(ctx, batch, statusChanges, func() {
+		n.nc.RemoveStatusListener(statusChanges)
+	})
 	return stream, nil
 }
+
+var errTaskStreamConnectionLost = errors.New("NATS connection lost while pulling task stream")
 
 type taskHandleStream struct {
 	messages chan common.TaskHandle
@@ -359,18 +368,43 @@ func (s *taskHandleStream) Err() error {
 	return s.err
 }
 
-func (s *taskHandleStream) forward(ctx context.Context, batch jetstream.MessageBatch) {
+func (s *taskHandleStream) forward(ctx context.Context, batch jetstream.MessageBatch, statusChanges <-chan nats.Status, removeStatusListener func()) {
+	defer removeStatusListener()
 	defer close(s.messages)
 	defer close(s.done)
-	for message := range batch.Messages() {
+	messages := batch.Messages()
+	for {
 		select {
-		case s.messages <- NewNatsMessageHandle(message):
 		case <-ctx.Done():
 			s.setError(ctx.Err())
 			return
+		case status, ok := <-statusChanges:
+			if !ok {
+				statusChanges = nil
+				continue
+			}
+			s.setError(fmt.Errorf("%w: %s", errTaskStreamConnectionLost, status))
+			return
+		case message, ok := <-messages:
+			if !ok {
+				s.setError(batch.Error())
+				return
+			}
+			select {
+			case s.messages <- NewNatsMessageHandle(message):
+			case <-ctx.Done():
+				s.setError(ctx.Err())
+				return
+			case status, ok := <-statusChanges:
+				if !ok {
+					statusChanges = nil
+					continue
+				}
+				s.setError(fmt.Errorf("%w: %s", errTaskStreamConnectionLost, status))
+				return
+			}
 		}
 	}
-	s.setError(batch.Error())
 }
 
 func (s *taskHandleStream) setError(err error) {
