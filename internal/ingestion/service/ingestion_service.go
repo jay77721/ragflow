@@ -380,8 +380,6 @@ func (e *Ingestor) start() error {
 	e.dispatcherWg.Add(1)
 	go e.consumeLoop()
 
-	RegisterActiveIngestor(e)
-
 	return nil
 }
 
@@ -1403,7 +1401,6 @@ func (e *Ingestor) recordTerminalPipelineLog(ctx context.Context, ingestionTask 
 // bounds the wait for non-cooperative task execution.
 func (e *Ingestor) Stop(ctx context.Context) {
 	common.Info(fmt.Sprintf("Stopping ingestor %s", e.id))
-	UnregisterActiveIngestor(e.id)
 	e.dispatchCancel()
 
 	waitDone := make(chan struct{})
