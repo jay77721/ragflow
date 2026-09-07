@@ -32,13 +32,12 @@ import (
 )
 
 type NatsEngine struct {
-	host       string
-	port       int
-	nc         *nats.Conn
-	jetStream  jetstream.JetStream
-	stream     jetstream.Stream
-	consumer   jetstream.Consumer
-	adminPulls chan struct{}
+	host      string
+	port      int
+	nc        *nats.Conn
+	jetStream jetstream.JetStream
+	stream    jetstream.Stream
+	consumer  jetstream.Consumer
 
 	// dataset-level compile consumer (§11) state.
 	knowledgeCompileStream   jetstream.Stream
@@ -53,9 +52,8 @@ type NatsEngine struct {
 
 func NewNatsEngine(host string, port int) *NatsEngine {
 	return &NatsEngine{
-		host:       host,
-		port:       port,
-		adminPulls: make(chan struct{}, 1),
+		host: host,
+		port: port,
 	}
 }
 
@@ -264,12 +262,6 @@ func (n *NatsEngine) InitConsumer(subject string) error {
 func (n *NatsEngine) PullMessagesForAdmin(messageCount int) ([]common.TaskHandle, error) {
 	if n.consumer == nil {
 		return nil, errors.New("NATS consumer is nil, engine not properly initialized")
-	}
-	select {
-	case n.adminPulls <- struct{}{}:
-		defer func() { <-n.adminPulls }()
-	default:
-		return nil, errors.New("manual task pull concurrency limit reached")
 	}
 
 	resultMessages := make([]common.TaskHandle, 0)

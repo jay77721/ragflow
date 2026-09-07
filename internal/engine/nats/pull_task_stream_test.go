@@ -244,11 +244,9 @@ func TestPullTaskStreamReportsMaxWaiting(t *testing.T) {
 	}
 }
 
-// TestPullMessagesForAdminLimitsConcurrentRequests prevents manual pulls from
-// consuming every MaxWaiting slot that the dispatcher needs. The default admin
-// quota admits one request and rejects the next without waiting for Fetch's
-// one-second expiry.
-func TestPullMessagesForAdminLimitsConcurrentRequests(t *testing.T) {
+// TestPullMessagesForAdminFetchesMessages verifies that manual pulls can retrieve
+// published task messages from the shared consumer.
+func TestPullMessagesForAdminFetchesMessages(t *testing.T) {
 	host, port := newEmbeddedNatsServer(t)
 	queue := NewNatsEngine(host, port)
 	if err := queue.Init(); err != nil {
@@ -258,36 +256,25 @@ func TestPullMessagesForAdminLimitsConcurrentRequests(t *testing.T) {
 		t.Fatalf("InitConsumer: %v", err)
 	}
 
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := queue.PullMessagesForAdmin(1)
-		firstDone <- err
-	}()
-	t.Cleanup(func() { <-firstDone })
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		info, err := queue.consumer.Info(t.Context())
-		if err != nil {
-			t.Fatalf("consumer info: %v", err)
-		}
-		if info.NumWaiting == 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	payload, err := json.Marshal(common.TaskMessage{
+		TaskID:   "admin-direct-pull",
+		TaskType: common.TaskTypeIngestionTask,
+	})
+	if err != nil {
+		t.Fatalf("marshal task: %v", err)
+	}
+	if err := queue.PublishTask(common.TaskSubject, payload); err != nil {
+		t.Fatalf("PublishTask: %v", err)
 	}
 
-	secondDone := make(chan error, 1)
-	go func() {
-		_, err := queue.PullMessagesForAdmin(1)
-		secondDone <- err
-	}()
-	select {
-	case err := <-secondDone:
-		if err == nil {
-			t.Fatal("second concurrent admin Pull succeeded, want quota rejection")
-		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("second concurrent admin Pull waited for the first Fetch to expire")
+	handles, err := queue.PullMessagesForAdmin(1)
+	if err != nil {
+		t.Fatalf("PullMessagesForAdmin: %v", err)
+	}
+	if len(handles) != 1 {
+		t.Fatalf("len(handles) = %d, want 1", len(handles))
+	}
+	if handles[0].GetMessage().TaskID != "admin-direct-pull" {
+		t.Fatalf("task id = %s, want admin-direct-pull", handles[0].GetMessage().TaskID)
 	}
 }
