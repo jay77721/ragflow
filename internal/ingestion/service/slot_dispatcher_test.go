@@ -267,3 +267,62 @@ func TestPullBatchReturnsOnlyUnmatchedSlots(t *testing.T) {
 	default:
 	}
 }
+
+// TestPullBatchCancellationLeavesReservedHandleUnsettled prevents shutdown
+// from blocking forever when a Pull has received a handle but its worker has
+// not yet taken the private inbox. The handle belongs to the broker again; it
+// must not be locally Acked, Nacked, or handed off after cancellation.
+func TestPullBatchCancellationLeavesReservedHandleUnsettled(t *testing.T) {
+	stream := newBlockingTaskHandleStream()
+	queue := &slotTestQueue{
+		streams: []*blockingTaskHandleStream{stream},
+		calls:   make(chan int, 1),
+	}
+	ingestor := newUnitIngestor("test-cancel-reserved-handle", 1, nil)
+	slot := &workerSlot{id: 1, inbox: make(chan common.TaskHandle)}
+
+	ingestor.pullWg.Add(1)
+	go ingestor.consumePullBatch(queue, []*workerSlot{slot})
+	t.Cleanup(func() {
+		ingestor.dispatchCancel()
+		ingestor.pullWg.Wait()
+	})
+
+	select {
+	case <-queue.calls:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Pull batch did not start")
+	}
+
+	handle := &fakeTaskHandle{msg: common.TaskMessage{TaskID: "reserved-on-stop"}}
+	sent := make(chan struct{})
+	go func() {
+		stream.messages <- handle
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Pull batch did not reserve the streamed handle")
+	}
+
+	ingestor.dispatchCancel()
+	waitDone := make(chan struct{})
+	go func() {
+		ingestor.pullWg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("cancelled reserved hand-off blocked Pull shutdown")
+	}
+	if handle.acks.Load() != 0 || handle.nacks.Load() != 0 {
+		t.Fatalf("reserved handle settlement = %d Ack / %d Nack, want none", handle.acks.Load(), handle.nacks.Load())
+	}
+	select {
+	case received := <-slot.inbox:
+		t.Fatalf("reserved handle was handed off after cancellation: %v", received)
+	default:
+	}
+}
