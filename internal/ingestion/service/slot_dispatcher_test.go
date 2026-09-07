@@ -129,3 +129,84 @@ func TestSlotDispatcherStartsNewPullWhileEarlierPullWaits(t *testing.T) {
 		t.Fatal("new idle slot waited for the earlier Pull to expire")
 	}
 }
+
+// TestSlotDispatcherBatchesSlotsAlreadyIdleInSameTurn prevents the dispatcher
+// from turning slots that are already available into redundant Pull(1)
+// requests. It must drain only the slots visible in this turn and issue one
+// Pull(K).
+func TestSlotDispatcherBatchesSlotsAlreadyIdleInSameTurn(t *testing.T) {
+	queue := &slotTestQueue{
+		streams: []*blockingTaskHandleStream{newBlockingTaskHandleStream()},
+		calls:   make(chan int, 1),
+	}
+	previousQueue := engine.GetMessageQueueEngine()
+	engine.SetMessageQueueEngine(queue)
+	t.Cleanup(func() { engine.SetMessageQueueEngine(previousQueue) })
+
+	ingestor := newUnitIngestor("test-batch-visible-slots", 2, nil)
+	ingestor.idleSlots <- &workerSlot{id: 1, inbox: make(chan common.TaskHandle)}
+	ingestor.idleSlots <- &workerSlot{id: 2, inbox: make(chan common.TaskHandle)}
+	ingestor.dispatcherWg.Add(1)
+	go ingestor.consumeLoop()
+	t.Cleanup(func() {
+		ingestor.dispatchCancel()
+		ingestor.dispatcherWg.Wait()
+		ingestor.pullWg.Wait()
+	})
+
+	select {
+	case max := <-queue.calls:
+		if max != 2 {
+			t.Fatalf("Pull max = %d, want 2 for the two visible slots", max)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("visible idle slots did not start a Pull")
+	}
+}
+
+// TestSlotDispatcherHandsOffFirstStreamMessageImmediately prevents a
+// slice-collecting Pull implementation from delaying the first task until the
+// requested batch fills or expires.
+func TestSlotDispatcherHandsOffFirstStreamMessageImmediately(t *testing.T) {
+	stream := newBlockingTaskHandleStream()
+	queue := &slotTestQueue{
+		streams: []*blockingTaskHandleStream{stream},
+		calls:   make(chan int, 1),
+	}
+	previousQueue := engine.GetMessageQueueEngine()
+	engine.SetMessageQueueEngine(queue)
+	t.Cleanup(func() { engine.SetMessageQueueEngine(previousQueue) })
+
+	ingestor := newUnitIngestor("test-first-stream-handoff", 2, nil)
+	firstSlot := &workerSlot{id: 1, inbox: make(chan common.TaskHandle)}
+	secondSlot := &workerSlot{id: 2, inbox: make(chan common.TaskHandle)}
+	ingestor.idleSlots <- firstSlot
+	ingestor.idleSlots <- secondSlot
+	ingestor.dispatcherWg.Add(1)
+	go ingestor.consumeLoop()
+	t.Cleanup(func() {
+		ingestor.dispatchCancel()
+		ingestor.dispatcherWg.Wait()
+		ingestor.pullWg.Wait()
+	})
+
+	select {
+	case max := <-queue.calls:
+		if max != 2 {
+			t.Fatalf("Pull max = %d, want 2", max)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("slots did not start Pull(2)")
+	}
+
+	handle := &fakeTaskHandle{msg: common.TaskMessage{TaskID: "first-stream-message"}}
+	go func() { stream.messages <- handle }()
+	select {
+	case received := <-firstSlot.inbox:
+		if received != handle {
+			t.Fatalf("handed-off handle = %v, want first stream handle", received)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("first stream message waited for the Pull batch to fill")
+	}
+}
