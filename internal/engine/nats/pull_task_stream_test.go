@@ -213,6 +213,54 @@ func TestPullTaskStreamReportsMaxWaiting(t *testing.T) {
 	}
 }
 
+// TestPullMessagesForAdminLimitsConcurrentRequests prevents manual pulls from
+// consuming every MaxWaiting slot that the dispatcher needs. The default admin
+// quota admits one request and rejects the next without waiting for Fetch's
+// one-second expiry.
+func TestPullMessagesForAdminLimitsConcurrentRequests(t *testing.T) {
+	host, port := newEmbeddedNatsServer(t)
+	queue := NewNatsEngine(host, port)
+	if err := queue.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := queue.InitConsumer(common.TaskSubject); err != nil {
+		t.Fatalf("InitConsumer: %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := queue.PullMessagesForAdmin(1)
+		firstDone <- err
+	}()
+	t.Cleanup(func() { <-firstDone })
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		info, err := queue.consumer.Info(t.Context())
+		if err != nil {
+			t.Fatalf("consumer info: %v", err)
+		}
+		if info.NumWaiting == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := queue.PullMessagesForAdmin(1)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err == nil {
+			t.Fatal("second concurrent admin Pull succeeded, want quota rejection")
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("second concurrent admin Pull waited for the first Fetch to expire")
+	}
+}
+
 // TestValidateTaskPullCapacityRejectsInsufficientMaxWaiting prevents startup
 // from accepting a dispatcher that the durable consumer cannot serve.
 func TestValidateTaskPullCapacityRejectsInsufficientMaxWaiting(t *testing.T) {
