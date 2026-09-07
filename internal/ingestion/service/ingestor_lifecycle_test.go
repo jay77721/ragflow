@@ -29,6 +29,7 @@ import (
 	"ragflow/internal/entity"
 	taskpkg "ragflow/internal/ingestion/task"
 	"ragflow/internal/ingestion/testutil"
+	servicepkg "ragflow/internal/service"
 )
 
 type startupTaskPublisher struct {
@@ -225,6 +226,49 @@ func TestStopDeadlineStopsStuckWorkerHeartbeat(t *testing.T) {
 
 	close(release)
 	ingestor.workerWg.Wait()
+	if handle.acks.Load() != 0 || handle.nacks.Load() != 0 {
+		t.Fatalf("timed-out handle settlement = %d Ack / %d Nack, want none", handle.acks.Load(), handle.nacks.Load())
+	}
+}
+
+// TestStopDeadlineLeavesStuckMemoryHandleUnsettled applies the same broker
+// redelivery rule to memory extraction: a non-cooperative memory runner must
+// not settle its old handle after the ingestor's Stop deadline passes.
+func TestStopDeadlineLeavesStuckMemoryHandleUnsettled(t *testing.T) {
+	ingestor := newUnitIngestor("test-stuck-memory", 1, nil)
+	ingestor.memorySvc = &servicepkg.MemoryMessageService{}
+	ingestor.startWorkerPool()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	ingestor.runMemoryTask = func(context.Context, string, map[string]any) error {
+		close(started)
+		<-release
+		return nil
+	}
+
+	handle := &fakeTaskHandle{msg: common.TaskMessage{
+		TaskID:   "memory-stop-timeout",
+		TaskType: common.TaskTypeMemory,
+		Payload:  []byte(`{}`),
+	}}
+	slot := <-ingestor.idleSlots
+	slot.inbox <- handle
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not enter memory runner")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ingestor.Stop(stopCtx)
+	cancel()
+
+	close(release)
+	ingestor.workerWg.Wait()
+	if handle.acks.Load() != 0 || handle.nacks.Load() != 0 {
+		t.Fatalf("timed-out memory handle settlement = %d Ack / %d Nack, want none", handle.acks.Load(), handle.nacks.Load())
+	}
 }
 
 // TestPollCancel_ExitsWhenDoneClosed verifies that closing the done channel

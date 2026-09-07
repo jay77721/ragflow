@@ -73,7 +73,7 @@ type Ingestor struct {
 	currentTasks  map[string]struct{} // set of task IDs currently claimed by a worker
 	tasksMu       sync.RWMutex
 	activeWorkers atomic.Int32 // number of worker goroutines currently in workerLoop
-	activeLeases  map[*Heartbeat]struct{}
+	activeLeases  map[*Heartbeat]*activeLease
 	leasesMu      sync.Mutex
 	stopLeases    atomic.Bool
 
@@ -141,6 +141,10 @@ type workerSlot struct {
 	inbox chan common.TaskHandle
 }
 
+type activeLease struct {
+	abandoned atomic.Bool
+}
+
 func NewIngestor(name string, maxConcurrency int32, supportedTypes []string) *Ingestor {
 	if maxConcurrency <= 0 {
 		maxConcurrency = int32(runtime.NumCPU())
@@ -160,7 +164,7 @@ func NewIngestor(name string, maxConcurrency int32, supportedTypes []string) *In
 		supportedDocTypes:   supportedTypes,
 		version:             "1.0.0",
 		currentTasks:        make(map[string]struct{}),
-		activeLeases:        make(map[*Heartbeat]struct{}),
+		activeLeases:        make(map[*Heartbeat]*activeLease),
 		idleSlots:           make(chan *workerSlot, maxConcurrency),
 		ShutdownCh:          make(chan struct{}, 1),
 		ingestionTaskSvc:    servicepkg.NewIngestionTaskService(),
@@ -485,6 +489,9 @@ func (e *Ingestor) handleAndExecute(handle common.TaskHandle) {
 
 func (e *Ingestor) ackHandle(hb *Heartbeat, handle common.TaskHandle, taskID string) {
 	hb.Stop()
+	if e.leaseAbandoned(hb) {
+		return
+	}
 	if err := handle.Ack(); err != nil {
 		common.Error(fmt.Sprintf("ack task %s", taskID), err)
 	}
@@ -492,6 +499,9 @@ func (e *Ingestor) ackHandle(hb *Heartbeat, handle common.TaskHandle, taskID str
 
 func (e *Ingestor) nackHandle(hb *Heartbeat, handle common.TaskHandle, taskID string) {
 	hb.Stop()
+	if e.leaseAbandoned(hb) {
+		return
+	}
 	if err := handle.Nack(); err != nil {
 		common.Error(fmt.Sprintf("nack task %s", taskID), err)
 	}
@@ -499,15 +509,22 @@ func (e *Ingestor) nackHandle(hb *Heartbeat, handle common.TaskHandle, taskID st
 
 func (e *Ingestor) renewDuplicateHandle(hb *Heartbeat, handle common.TaskHandle, taskID string) {
 	hb.Stop()
+	if e.leaseAbandoned(hb) {
+		return
+	}
 	if err := handle.InProgress(); err != nil {
 		common.Error(fmt.Sprintf("renew redelivered task %s", taskID), err)
 	}
 }
 
 func (e *Ingestor) registerLease(hb *Heartbeat) {
+	lease := &activeLease{}
 	e.leasesMu.Lock()
-	e.activeLeases[hb] = struct{}{}
 	stop := e.stopLeases.Load()
+	if stop {
+		lease.abandoned.Store(true)
+	}
+	e.activeLeases[hb] = lease
 	e.leasesMu.Unlock()
 	if stop {
 		hb.Stop()
@@ -520,12 +537,20 @@ func (e *Ingestor) unregisterLease(hb *Heartbeat) {
 	e.leasesMu.Unlock()
 }
 
+func (e *Ingestor) leaseAbandoned(hb *Heartbeat) bool {
+	e.leasesMu.Lock()
+	lease := e.activeLeases[hb]
+	e.leasesMu.Unlock()
+	return lease != nil && lease.abandoned.Load()
+}
+
 func (e *Ingestor) stopActiveLeases() {
 	e.leasesMu.Lock()
 	e.stopLeases.Store(true)
 	leases := make([]*Heartbeat, 0, len(e.activeLeases))
-	for lease := range e.activeLeases {
-		leases = append(leases, lease)
+	for heartbeat, lease := range e.activeLeases {
+		lease.abandoned.Store(true)
+		leases = append(leases, heartbeat)
 	}
 	e.leasesMu.Unlock()
 
@@ -587,7 +612,7 @@ func (e *Ingestor) executeMemoryTaskWithHeartbeat(ctx context.Context, taskCtx *
 			common.Error(fmt.Sprintf("memory task %s panicked: %v", taskID, r), fmt.Errorf("%v", r))
 			settleNack = true
 		}
-		if taskCtx.Handle == nil {
+		if taskCtx.Handle == nil || e.leaseAbandoned(hb) {
 			e.releaseTask(taskID)
 			return
 		}
@@ -919,6 +944,9 @@ func (e *Ingestor) settleMessageWithHeartbeat(ctx context.Context, taskCtx *task
 			e.markFailed(ctx, taskCtx.IngestionTask.ID)
 			terminal = false
 		}
+		if e.leaseAbandoned(hb) {
+			return
+		}
 		// Settlement authority is the DB, not the in-memory bool (BP1).
 		// Fall back to the in-memory bool only when the DB is unavailable.
 		if dbTerminal, ok := e.safeGetTerminal(ctx, taskCtx.IngestionTask.ID); ok {
@@ -1170,8 +1198,8 @@ func (e *Ingestor) Stop(ctx context.Context) {
 	case <-waitDone:
 		common.Info("All tasks completed")
 	case <-ctx.Done():
-		e.cancel()
 		e.stopActiveLeases()
+		e.cancel()
 		e.tasksMu.RLock()
 		ids := make([]string, 0, len(e.currentTasks))
 		for id := range e.currentTasks {
