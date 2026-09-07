@@ -15,7 +15,11 @@
 
 package config
 
-import "github.com/spf13/viper"
+import (
+	"fmt"
+
+	"github.com/spf13/viper"
+)
 
 type IngestorConfig struct {
 	// MaxConcurrentWorkers bounds how many ingestion tasks the ingestor runs in
@@ -27,6 +31,10 @@ type IngestorConfig struct {
 	// concurrency. The application validates the existing durable consumer
 	// against this value and never attempts to change MaxWaiting at runtime.
 	RequiredTaskPullWaiters int `mapstructure:"required_task_pull_waiters"`
+	// MaxAdminPullConcurrency bounds concurrent manual queue pulls in this
+	// process. Operators must include every deployment instance's value in
+	// RequiredTaskPullWaiters when sizing the shared durable consumer.
+	MaxAdminPullConcurrency int `mapstructure:"max_admin_pull_concurrency"`
 	// CompilerPoolSize bounds the process-wide knowledge-compilation worker
 	// pool that drives the cross-doc KNN / LLM-merge / write stages. 0/negative
 	// falls back to runtime.NumCPU() (or KC_COMPILE_CONCURRENCY if set).
@@ -37,6 +45,7 @@ func (c *Config) ParseIngestorConfig(v *viper.Viper) error {
 	// Default Ingestor config
 	c.ingestor.MaxConcurrentWorkers = 2
 	c.ingestor.RequiredTaskPullWaiters = 512
+	c.ingestor.MaxAdminPullConcurrency = 1
 	c.ingestor.CompilerPoolSize = 0
 
 	if !v.IsSet("ingestor") {
@@ -53,9 +62,19 @@ func (c *Config) ParseIngestorConfig(v *viper.Viper) error {
 	if sub.IsSet("required_task_pull_waiters") {
 		c.ingestor.RequiredTaskPullWaiters = sub.GetInt("required_task_pull_waiters")
 	}
+	if sub.IsSet("max_admin_pull_concurrency") {
+		c.ingestor.MaxAdminPullConcurrency = sub.GetInt("max_admin_pull_concurrency")
+	}
 
 	if sub.IsSet("compiler_pool_size") {
 		c.ingestor.CompilerPoolSize = sub.GetInt("compiler_pool_size")
+	}
+	if c.ingestor.MaxAdminPullConcurrency <= 0 {
+		return fmt.Errorf("ingestor max_admin_pull_concurrency must be positive: %d", c.ingestor.MaxAdminPullConcurrency)
+	}
+	if c.ingestor.RequiredTaskPullWaiters < c.ingestor.MaxAdminPullConcurrency {
+		return fmt.Errorf("ingestor required_task_pull_waiters %d is below max_admin_pull_concurrency %d",
+			c.ingestor.RequiredTaskPullWaiters, c.ingestor.MaxAdminPullConcurrency)
 	}
 
 	return nil

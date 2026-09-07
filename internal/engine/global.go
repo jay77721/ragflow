@@ -111,7 +111,11 @@ func InitMessageQueue() error {
 	switch messageQueueType {
 	case "nats":
 		natsConfig := globalConfig.GetNATSConfig()
-		messageQueueEngine = nats.NewNatsEngine(natsConfig.Host, natsConfig.Port)
+		messageQueueEngine = nats.NewNatsEngine(
+			natsConfig.Host,
+			natsConfig.Port,
+			globalConfig.GetIngestorConfig().MaxAdminPullConcurrency,
+		)
 		err := messageQueueEngine.Init()
 		if err != nil {
 			return err

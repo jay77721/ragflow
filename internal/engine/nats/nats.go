@@ -51,11 +51,15 @@ type NatsEngine struct {
 	syncerMu         sync.Mutex
 }
 
-func NewNatsEngine(host string, port int) *NatsEngine {
+func NewNatsEngine(host string, port int, adminPullLimits ...int) *NatsEngine {
+	adminPullLimit := 1
+	if len(adminPullLimits) > 0 && adminPullLimits[0] > 0 {
+		adminPullLimit = adminPullLimits[0]
+	}
 	return &NatsEngine{
 		host:       host,
 		port:       port,
-		adminPulls: make(chan struct{}, 1),
+		adminPulls: make(chan struct{}, adminPullLimit),
 	}
 }
 
