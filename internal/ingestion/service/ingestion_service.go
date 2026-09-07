@@ -41,6 +41,7 @@ import (
 	"ragflow/internal/utility"
 
 	"github.com/cenkalti/backoff/v5"
+	"go.uber.org/zap"
 )
 
 // defaultHeartbeatInterval paces the InProgress() working pulse that keeps an
@@ -132,18 +133,157 @@ type Ingestor struct {
 	// override this to simulate cancel without Redis.
 	cancelCheck func(ctx context.Context, taskID string) bool
 
-	// checkpointExists distinguishes a fresh run from a checkpoint resume.
-	// Tests inject this dependency so unit tests do not require Redis.
+	// Observability & Metrics (TaskRP.md §5.3)
+	idleSlotsCount      atomic.Int32
+	reservedSlotsCount  atomic.Int32
+	handlingSlotsCount  atomic.Int32
+	activePulls         atomic.Int32
+	pullExpiryCount     atomic.Int64
+	pullErrorCount      atomic.Int64
+	maxWaitingRejects   atomic.Int64
+	heartbeatFailures   atomic.Int64
+	ackCount            atomic.Int64
+	nackCount           atomic.Int64
+	duplicateClaimCount atomic.Int64
+	slotInvariantErrors atomic.Int64
+
 	checkpointExists func(ctx context.Context, taskID string) (bool, error)
+}
+
+// SlotState represents the lifecycle phase of a worker slot (TaskRP.md §2.2).
+type SlotState int32
+
+const (
+	SlotStateIdle SlotState = iota
+	SlotStateReserved
+	SlotStateHandling
+)
+
+func (s SlotState) String() string {
+	switch s {
+	case SlotStateIdle:
+		return "Idle"
+	case SlotStateReserved:
+		return "Reserved"
+	case SlotStateHandling:
+		return "Handling"
+	default:
+		return "Unknown"
+	}
 }
 
 type workerSlot struct {
 	id    int32
 	inbox chan common.TaskHandle
+	state atomic.Int32 // SlotState
 }
 
 type activeLease struct {
 	abandoned atomic.Bool
+}
+
+// IngestorStats captures a point-in-time snapshot of ingestor slot and scheduling metrics (TaskRP.md §5.3).
+type IngestorStats struct {
+	IdleSlots           int32 `json:"idle_slots"`
+	ReservedSlots       int32 `json:"reserved_slots"`
+	HandlingSlots       int32 `json:"handling_slots"`
+	ActivePulls         int32 `json:"active_pulls"`
+	PullExpiryCount     int64 `json:"pull_expiry_count"`
+	PullErrorCount      int64 `json:"pull_error_count"`
+	MaxWaitingRejects   int64 `json:"max_waiting_rejects"`
+	HeartbeatFailures   int64 `json:"heartbeat_failures"`
+	AckCount            int64 `json:"ack_count"`
+	NackCount           int64 `json:"nack_count"`
+	DuplicateClaims     int64 `json:"duplicate_claims"`
+	SlotInvariantErrors int64 `json:"slot_invariant_errors"`
+}
+
+func (e *Ingestor) Stats() IngestorStats {
+	return IngestorStats{
+		IdleSlots:           e.idleSlotsCount.Load(),
+		ReservedSlots:       e.reservedSlotsCount.Load(),
+		HandlingSlots:       e.handlingSlotsCount.Load(),
+		ActivePulls:         e.activePulls.Load(),
+		PullExpiryCount:     e.pullExpiryCount.Load(),
+		PullErrorCount:      e.pullErrorCount.Load(),
+		MaxWaitingRejects:   e.maxWaitingRejects.Load(),
+		HeartbeatFailures:   e.heartbeatFailures.Load(),
+		AckCount:            e.ackCount.Load(),
+		NackCount:           e.nackCount.Load(),
+		DuplicateClaims:     e.duplicateClaimCount.Load(),
+		SlotInvariantErrors: e.slotInvariantErrors.Load(),
+	}
+}
+
+func (e *Ingestor) markSlotIdle(slot *workerSlot) {
+	oldState := SlotState(slot.state.Swap(int32(SlotStateIdle)))
+	switch oldState {
+	case SlotStateHandling:
+		if e.handlingSlotsCount.Load() > 0 {
+			e.handlingSlotsCount.Add(-1)
+		}
+	case SlotStateReserved:
+		if e.reservedSlotsCount.Load() > 0 {
+			e.reservedSlotsCount.Add(-1)
+		}
+	}
+	e.idleSlotsCount.Add(1)
+	e.checkSlotInvariant()
+}
+
+func (e *Ingestor) markSlotReserved(slot *workerSlot) {
+	if slot.state.CompareAndSwap(int32(SlotStateIdle), int32(SlotStateReserved)) {
+		if e.idleSlotsCount.Load() > 0 {
+			e.idleSlotsCount.Add(-1)
+		}
+		e.reservedSlotsCount.Add(1)
+		e.checkSlotInvariant()
+	} else {
+		e.slotInvariantErrors.Add(1)
+		common.Error("slot transition to Reserved failed: unexpected old state",
+			fmt.Errorf("slot %d state is %s", slot.id, SlotState(slot.state.Load())),
+			zap.Int32("slot_id", slot.id),
+			zap.String("slot_state", SlotState(slot.state.Load()).String()),
+		)
+	}
+}
+
+func (e *Ingestor) markSlotHandling(slot *workerSlot) {
+	if slot.state.CompareAndSwap(int32(SlotStateReserved), int32(SlotStateHandling)) {
+		if e.reservedSlotsCount.Load() > 0 {
+			e.reservedSlotsCount.Add(-1)
+		}
+		e.handlingSlotsCount.Add(1)
+		e.checkSlotInvariant()
+	} else {
+		e.slotInvariantErrors.Add(1)
+		common.Error("slot transition to Handling failed: unexpected old state",
+			fmt.Errorf("slot %d state is %s", slot.id, SlotState(slot.state.Load())),
+			zap.Int32("slot_id", slot.id),
+			zap.String("slot_state", SlotState(slot.state.Load()).String()),
+		)
+	}
+}
+
+func (e *Ingestor) checkSlotInvariant() {
+	if e.dispatchCtx.Err() != nil {
+		return
+	}
+	idle := e.idleSlotsCount.Load()
+	reserved := e.reservedSlotsCount.Load()
+	handling := e.handlingSlotsCount.Load()
+	total := idle + reserved + handling
+	if e.activeWorkers.Load() == e.maxConcurrency && total != e.maxConcurrency {
+		e.slotInvariantErrors.Add(1)
+		common.Error("slot conservation invariant violated",
+			fmt.Errorf("idle (%d) + reserved (%d) + handling (%d) = %d != maxConcurrency (%d)",
+				idle, reserved, handling, total, e.maxConcurrency),
+			zap.Int32("idle_slots", idle),
+			zap.Int32("reserved_slots", reserved),
+			zap.Int32("handling_slots", handling),
+			zap.Int32("max_concurrency", e.maxConcurrency),
+		)
+	}
 }
 
 func NewIngestor(name string, maxConcurrency int32, supportedTypes []string) *Ingestor {
@@ -248,12 +388,14 @@ func (e *Ingestor) consumeLoop() {
 		case <-e.dispatchCtx.Done():
 			return
 		case firstSlot = <-e.idleSlots:
+			e.markSlotReserved(firstSlot)
 		}
 
 		slots := []*workerSlot{firstSlot}
 		for {
 			select {
 			case slot := <-e.idleSlots:
+				e.markSlotReserved(slot)
 				slots = append(slots, slot)
 			default:
 				goto startPull
@@ -262,6 +404,7 @@ func (e *Ingestor) consumeLoop() {
 
 	startPull:
 		if e.dispatchCtx.Err() != nil {
+			e.returnIdleSlots(slots)
 			return
 		}
 		e.pullWg.Add(1)
@@ -271,11 +414,18 @@ func (e *Ingestor) consumeLoop() {
 
 func (e *Ingestor) consumePullBatch(messageQueueEngine engine.MessageQueue, slots []*workerSlot) {
 	defer e.pullWg.Done()
+	e.activePulls.Add(1)
+	defer e.activePulls.Add(-1)
 
+	pullStart := time.Now()
 	pullCtx, cancel := context.WithTimeout(e.dispatchCtx, taskPullRequestTimeout)
 	defer cancel()
 	stream, err := messageQueueEngine.PullTaskStream(pullCtx, len(slots))
 	if err != nil {
+		e.pullErrorCount.Add(1)
+		if strings.Contains(strings.ToLower(err.Error()), "max waiting") || strings.Contains(strings.ToLower(err.Error()), "capacity") {
+			e.maxWaitingRejects.Add(1)
+		}
 		e.logPullError(err)
 		e.waitAfterPullError()
 		e.returnIdleSlots(slots)
@@ -283,18 +433,46 @@ func (e *Ingestor) consumePullBatch(messageQueueEngine engine.MessageQueue, slot
 	}
 
 	matched := 0
+	firstArrived := false
 	for handle := range stream.Messages() {
+		recvTime := time.Now()
+		if !firstArrived {
+			firstArrived = true
+			latency := time.Since(pullStart)
+			common.Debug(fmt.Sprintf("Pull delivered first handle in %v", latency),
+				zap.Duration("pull_first_handle_latency", latency),
+				zap.Int32("active_pulls", e.activePulls.Load()),
+			)
+		}
 		if matched == len(slots) {
 			break
 		}
+		targetSlot := slots[matched]
+		e.markSlotHandling(targetSlot)
 		select {
-		case slots[matched].inbox <- handle:
+		case targetSlot.inbox <- handle:
 			matched++
+			handoffDuration := time.Since(recvTime)
+			common.Debug(fmt.Sprintf("Handed off handle to worker slot %d in %v", targetSlot.id, handoffDuration),
+				zap.Int32("slot_id", targetSlot.id),
+				zap.Duration("handoff_duration", handoffDuration),
+				zap.Int32("idle_slots", e.idleSlotsCount.Load()),
+				zap.Int32("reserved_slots", e.reservedSlotsCount.Load()),
+				zap.Int32("handling_slots", e.handlingSlotsCount.Load()),
+			)
 		case <-e.dispatchCtx.Done():
+			e.returnIdleSlots(slots[matched+1:])
 			return
 		}
 	}
+	if matched == 0 && stream.Err() == nil {
+		e.pullExpiryCount.Add(1)
+	}
 	if err := stream.Err(); err != nil {
+		e.pullErrorCount.Add(1)
+		if strings.Contains(strings.ToLower(err.Error()), "max waiting") || strings.Contains(strings.ToLower(err.Error()), "capacity") {
+			e.maxWaitingRejects.Add(1)
+		}
 		e.logPullError(err)
 		e.waitAfterPullError()
 	}
@@ -317,9 +495,11 @@ func (e *Ingestor) waitAfterPullError() {
 
 func (e *Ingestor) returnIdleSlots(slots []*workerSlot) {
 	for _, slot := range slots {
+		e.markSlotIdle(slot)
 		select {
 		case e.idleSlots <- slot:
 		case <-e.dispatchCtx.Done():
+			e.idleSlotsCount.Add(-1)
 			return
 		}
 	}
@@ -405,9 +585,26 @@ func (e *Ingestor) compileLoop(id int32) {
 // handleAndExecute owns one handle from its hand-off to final settlement. It
 // runs only in the worker that received the handle through its private inbox.
 func (e *Ingestor) handleAndExecute(handle common.TaskHandle) {
+	startTime := time.Now()
 	taskMessage := handle.GetMessage()
-	common.Info(fmt.Sprintf("Received task id: %s, type: %s", taskMessage.TaskID, taskMessage.TaskType))
-	hb := NewHeartbeat(taskMessage.TaskID, handle, e.heartbeatInterval).WithContext(context.Background())
+	common.Info(fmt.Sprintf("Received task id: %s, type: %s", taskMessage.TaskID, taskMessage.TaskType),
+		zap.String("task_id", taskMessage.TaskID),
+		zap.String("task_type", taskMessage.TaskType),
+		zap.Int32("idle_slots", e.idleSlotsCount.Load()),
+		zap.Int32("reserved_slots", e.reservedSlotsCount.Load()),
+		zap.Int32("handling_slots", e.handlingSlotsCount.Load()),
+	)
+	defer func() {
+		settlementDuration := time.Since(startTime)
+		common.Debug(fmt.Sprintf("Task %s settlement finished in %v", taskMessage.TaskID, settlementDuration),
+			zap.String("task_id", taskMessage.TaskID),
+			zap.Duration("settlement_duration", settlementDuration),
+		)
+	}()
+
+	hb := NewHeartbeat(taskMessage.TaskID, handle, e.heartbeatInterval).
+		WithContext(context.Background()).
+		WithOnError(func(_ error) { e.heartbeatFailures.Add(1) })
 	hb.Start()
 	e.registerLease(hb)
 	defer e.unregisterLease(hb)
@@ -494,6 +691,8 @@ func (e *Ingestor) ackHandle(hb *Heartbeat, handle common.TaskHandle, taskID str
 	}
 	if err := handle.Ack(); err != nil {
 		common.Error(fmt.Sprintf("ack task %s", taskID), err)
+	} else {
+		e.ackCount.Add(1)
 	}
 }
 
@@ -504,11 +703,14 @@ func (e *Ingestor) nackHandle(hb *Heartbeat, handle common.TaskHandle, taskID st
 	}
 	if err := handle.Nack(); err != nil {
 		common.Error(fmt.Sprintf("nack task %s", taskID), err)
+	} else {
+		e.nackCount.Add(1)
 	}
 }
 
 func (e *Ingestor) renewDuplicateHandle(hb *Heartbeat, handle common.TaskHandle, taskID string) {
 	hb.Stop()
+	e.duplicateClaimCount.Add(1)
 	if e.leaseAbandoned(hb) {
 		return
 	}
@@ -576,9 +778,11 @@ func (e *Ingestor) workerLoop(slot *workerSlot) {
 	e.activeWorkers.Add(1)
 	common.Info(fmt.Sprintf("Worker %d started", slot.id))
 	for {
+		e.markSlotIdle(slot)
 		select {
 		case e.idleSlots <- slot:
 		case <-e.dispatchCtx.Done():
+			e.idleSlotsCount.Add(-1)
 			return
 		}
 
@@ -619,10 +823,14 @@ func (e *Ingestor) executeMemoryTaskWithHeartbeat(ctx context.Context, taskCtx *
 		if settleAck {
 			if err := taskCtx.Handle.Ack(); err != nil {
 				common.Error(fmt.Sprintf("ack memory task %s", taskID), err)
+			} else {
+				e.ackCount.Add(1)
 			}
 		} else if settleNack {
 			if err := taskCtx.Handle.Nack(); err != nil {
 				common.Error(fmt.Sprintf("nack memory task %s", taskID), err)
+			} else {
+				e.nackCount.Add(1)
 			}
 		}
 		e.releaseTask(taskID)
@@ -983,11 +1191,15 @@ func (e *Ingestor) ackOrNack(taskCtx *taskpkg.TaskContext, terminal bool) {
 	if terminal {
 		if err := taskCtx.Handle.Ack(); err != nil {
 			common.Error(fmt.Sprintf("ack task %s", taskCtx.IngestionTask.ID), err)
+		} else {
+			e.ackCount.Add(1)
 		}
 		return
 	}
 	if err := taskCtx.Handle.Nack(); err != nil {
 		common.Error(fmt.Sprintf("nack task %s", taskCtx.IngestionTask.ID), err)
+	} else {
+		e.nackCount.Add(1)
 	}
 }
 
