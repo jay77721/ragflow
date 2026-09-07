@@ -173,6 +173,60 @@ func TestStop_TimesOutWhenWorkerStuck(t *testing.T) {
 	ingestor.workerWg.Wait()
 }
 
+// TestStopDeadlineStopsStuckWorkerHeartbeat prevents a task that ignores
+// execution cancellation from renewing its broker lease after graceful
+// shutdown has timed out. Once Stop returns at its deadline, the unfinished
+// handle must be left for broker redelivery instead of being kept alive by a
+// leaked heartbeat.
+func TestStopDeadlineStopsStuckWorkerHeartbeat(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanup := testutil.ReplaceDBForTest(t, db)
+	defer cleanup()
+	_, _, _, taskID := testutil.SeedTestData(t, db, testutil.WithPipelineID("flow-1"))
+
+	ingestor := newUnitIngestor("test-stuck-heartbeat", 1, []string{"pdf"})
+	ingestor.heartbeatInterval = 10 * time.Millisecond
+	ingestor.startWorkerPool()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	ingestor.runDocumentTask = func(context.Context, *entity.IngestionTask) error {
+		close(started)
+		<-release
+		return nil
+	}
+
+	handle := &fakeTaskHandle{msg: common.TaskMessage{TaskID: taskID, TaskType: common.TaskTypeIngestionTask}}
+	slot := <-ingestor.idleSlots
+	slot.inbox <- handle
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not enter runDocumentTask")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for handle.inProgress.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if handle.inProgress.Load() == 0 {
+		t.Fatal("heartbeat did not renew the running handle")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ingestor.Stop(stopCtx)
+	cancel()
+
+	pulsesAtStop := handle.inProgress.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := handle.inProgress.Load(); got != pulsesAtStop {
+		t.Fatalf("heartbeat renewals after Stop deadline = %d, want none", got-pulsesAtStop)
+	}
+
+	close(release)
+	ingestor.workerWg.Wait()
+}
+
 // TestPollCancel_ExitsWhenDoneClosed verifies that closing the done channel
 // causes pollCancel to return even when cancelCheck is blocked (e.g. on a
 // long DB query). Without BP3, the initial cancelCheck call runs

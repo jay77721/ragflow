@@ -73,6 +73,9 @@ type Ingestor struct {
 	currentTasks  map[string]struct{} // set of task IDs currently claimed by a worker
 	tasksMu       sync.RWMutex
 	activeWorkers atomic.Int32 // number of worker goroutines currently in workerLoop
+	activeLeases  map[*Heartbeat]struct{}
+	leasesMu      sync.Mutex
+	stopLeases    atomic.Bool
 
 	// Shutdown channel - receive on this to trigger graceful shutdown
 	ShutdownCh chan struct{}
@@ -157,6 +160,7 @@ func NewIngestor(name string, maxConcurrency int32, supportedTypes []string) *In
 		supportedDocTypes:   supportedTypes,
 		version:             "1.0.0",
 		currentTasks:        make(map[string]struct{}),
+		activeLeases:        make(map[*Heartbeat]struct{}),
 		idleSlots:           make(chan *workerSlot, maxConcurrency),
 		ShutdownCh:          make(chan struct{}, 1),
 		ingestionTaskSvc:    servicepkg.NewIngestionTaskService(),
@@ -401,6 +405,8 @@ func (e *Ingestor) handleAndExecute(handle common.TaskHandle) {
 	common.Info(fmt.Sprintf("Received task id: %s, type: %s", taskMessage.TaskID, taskMessage.TaskType))
 	hb := NewHeartbeat(taskMessage.TaskID, handle, e.heartbeatInterval).WithContext(context.Background())
 	hb.Start()
+	e.registerLease(hb)
+	defer e.unregisterLease(hb)
 
 	// Memory-extraction tasks share the tasks.RAGFLOW consumer and the worker
 	// pool with ingestion tasks. They do NOT use the ingestion state machine.
@@ -495,6 +501,36 @@ func (e *Ingestor) renewDuplicateHandle(hb *Heartbeat, handle common.TaskHandle,
 	hb.Stop()
 	if err := handle.InProgress(); err != nil {
 		common.Error(fmt.Sprintf("renew redelivered task %s", taskID), err)
+	}
+}
+
+func (e *Ingestor) registerLease(hb *Heartbeat) {
+	e.leasesMu.Lock()
+	e.activeLeases[hb] = struct{}{}
+	stop := e.stopLeases.Load()
+	e.leasesMu.Unlock()
+	if stop {
+		hb.Stop()
+	}
+}
+
+func (e *Ingestor) unregisterLease(hb *Heartbeat) {
+	e.leasesMu.Lock()
+	delete(e.activeLeases, hb)
+	e.leasesMu.Unlock()
+}
+
+func (e *Ingestor) stopActiveLeases() {
+	e.leasesMu.Lock()
+	e.stopLeases.Store(true)
+	leases := make([]*Heartbeat, 0, len(e.activeLeases))
+	for lease := range e.activeLeases {
+		leases = append(leases, lease)
+	}
+	e.leasesMu.Unlock()
+
+	for _, lease := range leases {
+		lease.Stop()
 	}
 }
 
@@ -1135,6 +1171,7 @@ func (e *Ingestor) Stop(ctx context.Context) {
 		common.Info("All tasks completed")
 	case <-ctx.Done():
 		e.cancel()
+		e.stopActiveLeases()
 		e.tasksMu.RLock()
 		ids := make([]string, 0, len(e.currentTasks))
 		for id := range e.currentTasks {
